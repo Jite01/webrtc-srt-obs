@@ -1,0 +1,125 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>WebRTC SRT Contribution</title>
+  <style>
+    :root { color-scheme: dark; font-family: system-ui, sans-serif; background: #111827; color: #f8fafc; }
+    body { margin: 0; min-height: 100vh; display: grid; place-items: center; }
+    main { width: min(100%, 42rem); padding: 1rem; box-sizing: border-box; }
+    video { width: 100%; max-height: 72vh; background: #000; object-fit: contain; }
+    .bar { display: flex; align-items: center; justify-content: space-between; gap: 1rem; padding: .75rem 0; }
+    button { border: 0; padding: .7rem 1rem; background: #14b8a6; color: #06221f; font-weight: 700; border-radius: 4px; }
+    button[disabled] { opacity: .55; }
+    #status { font-size: .9rem; }
+  </style>
+</head>
+<body>
+  <main>
+    <video id="preview" autoplay muted playsinline></video>
+    <div class="bar">
+      <span id="status" role="status">Ready</span>
+      <button id="toggle" type="button">Start stream</button>
+    </div>
+  </main>
+  <script>
+    const preview = document.querySelector('#preview');
+    const toggle = document.querySelector('#toggle');
+    const status = document.querySelector('#status');
+    let stream;
+    let peer;
+    let reconnectTimer;
+    let intentionalStop = false;
+    let connecting = false;
+
+    const setStatus = value => { status.textContent = value; };
+    const waitForIceGathering = pc => new Promise(resolve => {
+      if (pc.iceGatheringState === 'complete') return resolve();
+      const checkState = () => {
+        if (pc.iceGatheringState === 'complete') {
+          pc.removeEventListener('icegatheringstatechange', checkState);
+          resolve();
+        }
+      };
+      pc.addEventListener('icegatheringstatechange', checkState);
+    });
+
+    async function connect() {
+      if (connecting || intentionalStop) return;
+      connecting = true;
+      clearTimeout(reconnectTimer);
+      const previousPeer = peer;
+      peer = undefined;
+      if (previousPeer) previousPeer.close();
+
+      try {
+        setStatus('Connecting');
+        const pc = new RTCPeerConnection({ iceServers: [] });
+        peer = pc;
+        stream.getTracks().forEach(track => pc.addTrack(track, stream));
+        pc.addEventListener('connectionstatechange', () => {
+          if (peer !== pc) return;
+          const state = pc.connectionState;
+          setStatus(`Connection: ${state}`);
+          if (!intentionalStop && (state === 'failed' || state === 'disconnected' || state === 'closed')) {
+            reconnectTimer = setTimeout(connect, 1000);
+          }
+        });
+        const offer = await pc.createOffer();
+        await pc.setLocalDescription(offer);
+        await waitForIceGathering(pc);
+        const response = await fetch('/offer', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify(pc.localDescription),
+        });
+        if (!response.ok) throw new Error(await response.text());
+        if (peer === pc) await pc.setRemoteDescription(await response.json());
+      } catch (error) {
+        console.error(error);
+        setStatus(`Reconnect pending: ${error.message}`);
+        if (!intentionalStop) reconnectTimer = setTimeout(connect, 1500);
+      } finally {
+        connecting = false;
+      }
+    }
+
+    async function start() {
+      try {
+        intentionalStop = false;
+        toggle.disabled = true;
+        stream = await navigator.mediaDevices.getUserMedia({
+          video: { facingMode: { ideal: 'environment' }, width: { ideal: 1280 }, height: { ideal: 720 }, frameRate: { ideal: 30, max: 30 } },
+          audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false },
+        });
+        preview.srcObject = stream;
+        toggle.textContent = 'Stop stream';
+        await connect();
+      } catch (error) {
+        console.error(error);
+        setStatus(`Camera or microphone error: ${error.message}`);
+        stop();
+      } finally {
+        toggle.disabled = false;
+      }
+    }
+
+    function stop() {
+      intentionalStop = true;
+      clearTimeout(reconnectTimer);
+      if (peer) peer.close();
+      peer = undefined;
+      if (stream) stream.getTracks().forEach(track => track.stop());
+      stream = undefined;
+      preview.srcObject = null;
+      toggle.textContent = 'Start stream';
+      toggle.disabled = false;
+      setStatus('Stopped');
+    }
+
+    toggle.addEventListener('click', () => stream ? stop() : start());
+    window.addEventListener('beforeunload', stop);
+  </script>
+</body>
+</html>
