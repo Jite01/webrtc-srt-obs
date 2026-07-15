@@ -94,11 +94,3 @@ The expected 400-800 ms end-to-end range assumes a stable LAN, a reasonably fast
 - Raw-frame transfer from aiortc to FFmpeg necessarily includes pixel-format conversion and a memory copy. It is the required boundary between decoded WebRTC frames and FFmpeg in this architecture.
 - OBS SRT/Media Source behavior varies slightly by OBS and bundled FFmpeg version.
 
-## Phase 1B
-
-- Add authenticated signaling and short-lived stream credentials.
-- Add TURN for non-LAN networks and explicit ICE diagnostics.
-- Add health endpoints, structured metrics, and glass-to-glass latency telemetry.
-- Add controlled hardware-encoder profiles and adaptive bitrate/resolution policy.
-- Add a robust reconnect handoff that keeps OBS continuously fed during browser re-negotiation.
-- Add deployment configuration, systemd service files, and integration tests against OBS/FFmpeg.
