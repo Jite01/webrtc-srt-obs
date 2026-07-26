@@ -23,9 +23,41 @@ from av import AudioFrame, AudioResampler, VideoFrame
 
 LOG = logging.getLogger("webrtc_srt")
 ROOT = Path(__file__).resolve().parent
-DLC_ROOT = Path(os.environ.get("DEEP_LIVE_CAM_ROOT", ROOT.parent / "Deep-Live-Cam-upstream"))
+
+# Repository lookup order:
+#   1. DEEP_LIVE_CAM_ROOT environment variable
+#   2. Local fork (preferred)
+#   3. Upstream clone (fallback)
+_env_root = os.environ.get("DEEP_LIVE_CAM_ROOT")
+
+if _env_root:
+    DLC_ROOT = Path(_env_root).expanduser().resolve()
+else:
+    candidates = (
+        ROOT.parent / "hacksider_Deep-Live-Cam",
+        ROOT.parent / "Deep-Live-Cam-upstream",
+    )
+
+    DLC_ROOT = next((p.resolve() for p in candidates if p.exists()), None)
+
+    if DLC_ROOT is None:
+        raise RuntimeError(
+            "Deep-Live-Cam repository not found.\n"
+            "Either set DEEP_LIVE_CAM_ROOT or clone "
+            "'hacksider_Deep-Live-Cam' beside this project."
+        )
+
+inference_file = DLC_ROOT / "inference.py"
+if not inference_file.exists():
+    raise FileNotFoundError(
+        f"Expected inference.py in {DLC_ROOT}"
+    )
+
 if str(DLC_ROOT) not in sys.path:
     sys.path.insert(0, str(DLC_ROOT))
+
+LOG.info("Using Deep-Live-Cam repository: %s", DLC_ROOT)
+
 from inference import InferenceEngine
 
 
