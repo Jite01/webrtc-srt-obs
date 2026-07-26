@@ -6,11 +6,13 @@ from __future__ import annotations
 import argparse
 import asyncio
 import contextlib
+from concurrent.futures import ThreadPoolExecutor
 import errno
 import logging
 import os
 import signal
 import ssl
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -21,6 +23,10 @@ from av import AudioFrame, AudioResampler, VideoFrame
 
 LOG = logging.getLogger("webrtc_srt")
 ROOT = Path(__file__).resolve().parent
+DLC_ROOT = Path(os.environ.get("DEEP_LIVE_CAM_ROOT", ROOT.parent / "Deep-Live-Cam-upstream"))
+if str(DLC_ROOT) not in sys.path:
+    sys.path.insert(0, str(DLC_ROOT))
+from inference import InferenceEngine
 
 
 class BridgeClosedError(RuntimeError):
@@ -265,9 +271,13 @@ class FfmpegBridge:
 class StreamSession:
     """Owns the one allowed peer connection and its FFmpeg bridge."""
 
-    def __init__(self, config: StreamConfig) -> None:
+    def __init__(self, config: StreamConfig, engine: InferenceEngine) -> None:
         self.pc = RTCPeerConnection()
         self.bridge = FfmpegBridge(config)
+        self.engine = engine
+        self.executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="dlc-inference")
+        self.latest_frame: Any | None = None
+        self._video_worker: asyncio.Task[None] | None = None
         self.tasks: set[asyncio.Task[None]] = set()
         self.closed = False
 
@@ -297,12 +307,35 @@ class StreamSession:
                 frame = await track.recv()
                 if not self.bridge.running:
                     await self.bridge.start(frame.width, frame.height)
-                await self.bridge.write_video(frame)
+                # One overwrite slot keeps latency bounded while inference is busy.
+                self.latest_frame = frame.to_ndarray(format="bgr24")
+                if self._video_worker is None or self._video_worker.done():
+                    self._video_worker = asyncio.create_task(self._drain_latest_video(), name="dlc-inference")
+                    self.tasks.add(self._video_worker)
+                    self._video_worker.add_done_callback(self.tasks.discard)
         except (BridgeClosedError, asyncio.CancelledError):
             raise
         except Exception:
             LOG.exception("video_track_failed")
             await self.close()
+
+    async def _drain_latest_video(self) -> None:
+        loop = asyncio.get_running_loop()
+        LOG.info("inference_worker_started")
+        try:
+            while self.latest_frame is not None and not self.closed:
+                bgr = self.latest_frame
+                self.latest_frame = None
+                result = await loop.run_in_executor(self.executor, self.engine.process_frame, bgr)
+                output = VideoFrame.from_ndarray(result, format="bgr24").reformat(format="yuv420p")
+                await self.bridge.write_video(output)
+        except (BridgeClosedError, asyncio.CancelledError):
+            raise
+        except Exception:
+            LOG.exception("inference_worker_failed")
+            await self.close()
+        finally:
+            LOG.info("inference_worker_stopped")
 
     async def _consume_audio(self, track: AudioStreamTrack) -> None:
         resampler = AudioResampler(format="s16", layout="stereo", rate=48000)
@@ -326,12 +359,14 @@ class StreamSession:
                 task.cancel()
         await self.pc.close()
         await self.bridge.close()
+        await asyncio.to_thread(self.executor.shutdown, True, cancel_futures=True)
         LOG.info("stream_session_closed")
 
 
 class ContributionServer:
-    def __init__(self, config: StreamConfig) -> None:
+    def __init__(self, config: StreamConfig, engine: InferenceEngine) -> None:
         self.config = config
+        self.engine = engine
         self.session: StreamSession | None = None
         self.lock = asyncio.Lock()
 
@@ -348,7 +383,7 @@ class ContributionServer:
         async with self.lock:
             if self.session is not None:
                 await self.session.close()
-            session = StreamSession(self.config)
+            session = StreamSession(self.config, self.engine)
             self.session = session
 
             try:
@@ -371,10 +406,11 @@ class ContributionServer:
             if self.session is not None:
                 await self.session.close()
                 self.session = None
+        self.engine.teardown()
 
 
-def create_app(config: StreamConfig) -> web.Application:
-    server = ContributionServer(config)
+def create_app(config: StreamConfig, engine: InferenceEngine) -> web.Application:
+    server = ContributionServer(config, engine)
     app = web.Application(client_max_size=1024 * 1024)
     app["contribution_server"] = server
     app.router.add_get("/", lambda request: web.FileResponse(ROOT / "index.html"))
@@ -389,6 +425,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--port", type=int, default=8443)
     parser.add_argument("--cert-file", type=Path, help="PEM certificate required for phone camera access")
     parser.add_argument("--key-file", type=Path, help="PEM private key required with --cert-file")
+    parser.add_argument("--source", required=True, help="character source image path")
+    parser.add_argument("--execution-provider", choices=("cuda", "cpu"), default="cuda")
     parser.add_argument("--ffmpeg", default="ffmpeg")
     parser.add_argument(
         "--srt-url",
@@ -423,6 +461,7 @@ def main() -> None:
     else:
         LOG.warning("https_disabled browser camera and microphone access will fail on most phones")
 
+    engine = InferenceEngine(args.source, args.execution_provider)
     config = StreamConfig(
         ffmpeg=args.ffmpeg,
         srt_url=args.srt_url,
@@ -431,7 +470,7 @@ def main() -> None:
         audio_bitrate=args.audio_bitrate,
         gop_seconds=args.gop_seconds,
     )
-    app = create_app(config)
+    app = create_app(config, engine)
     web.run_app(app, host=args.host, port=args.port, ssl_context=tls, handle_signals=True)
 
 
